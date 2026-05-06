@@ -28,7 +28,7 @@ const { URL } = require('url');
 const { execSync, execFileSync } = require('child_process');
 const { getProjectRoot } = require('../utils/project-paths');
 
-const NUWAXCODE_VERSION = '1.1.83';
+const NUWAXCODE_VERSION = '1.1.95';
 const NUWAXCODE_REPO = process.env.NUWAXCODE_REPO || 'nuwax-ai/nuwaxcode';
 
 const projectRoot = getProjectRoot();
@@ -344,11 +344,11 @@ async function downloadFromRelease(key) {
     }
   }
 
-  // Release asset: nuwaxcode-{platform}-{arch}.tar.gz
-  const assetName = `${distName}.tar.gz`;
-  const downloadUrl = `https://github.com/${NUWAXCODE_REPO}/releases/download/v${NUWAXCODE_VERSION}/${assetName}`;
-
-  console.log(`[prepare-nuwaxcode] ${key}: 下载 ${assetName} ...`);
+  // Release 资产命名兼容策略：
+  // 1) 新命名（带版本后缀）：nuwaxcode-xxx-v1.1.95.tar.gz
+  // 2) 旧命名（不带版本后缀）：nuwaxcode-xxx.tar.gz
+  // 先尝试新命名，404 再回退旧命名，兼容历史 release 与新 CI 命名规则。
+  const assetCandidates = [`${distName}-v${NUWAXCODE_VERSION}.tar.gz`, `${distName}.tar.gz`];
 
   // Windows：PATH 里常见的是 System32 的 bsdtar，它不认 MSYS 的 /d/a/... 路径，
   // 只认盘符路径（D:\... 或 D:/...）。Git for Windows 的 GNU tar 也接受 D:/...。
@@ -361,117 +361,122 @@ async function downloadFromRelease(key) {
     return `${drive}:/${rest}`;
   };
 
-  try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const force = attempt > 0;
-      if (force) {
-        console.warn(
-          `[prepare-nuwaxcode] ${key}: 归档解压失败（常见于缓存被截断），将删除缓存并重新下载 ${assetName}`,
-        );
-      }
-
-      const archivePath = await download(downloadUrl, assetName, { force });
-
-      // 解压到临时目录
-      const extractDir = path.join(cacheDir, `extract-${key}`);
-      if (fs.existsSync(extractDir)) {
-        try { fs.rmSync(extractDir, { recursive: true }); } catch (_) {}
-      }
-      fs.mkdirSync(extractDir, { recursive: true });
-
-      const tarArchivePath = toTarPath(archivePath);
-      const tarExtractDir = toTarPath(extractDir);
-
-      // 使用参数数组调用 tar，避免在 Windows/MSYS 下对 C:\ 路径的错误解析。
-      // --force-local 仅在 win32 且 tar 支持时使用（macOS BSD tar 不支持该选项）。
-      const tarArgs = ['-xzf', tarArchivePath, '-C', tarExtractDir];
-      if (process.platform === 'win32') {
-        try {
-          const tarHelp = execFileSync('tar', ['--help'], { encoding: 'utf-8', stdio: 'pipe' });
-          if (typeof tarHelp === 'string' && tarHelp.includes('--force-local')) {
-            tarArgs.unshift('--force-local');
-          }
-        } catch (_) {}
-      }
-
-      try {
-        execFileSync('tar', tarArgs, { stdio: 'pipe' });
-      } catch (tarErr) {
-        if (attempt === 1) throw tarErr;
-        continue;
-      }
-
-      // 查找二进制文件：
-      // 1) 旧包结构通常是 bin/nuwaxcode
-      // 2) 新包结构可能是根目录单文件 opencode
-      const binaryCandidates = getBinaryCandidates(key);
-      const binaryPath = findBinary(extractDir, binaryCandidates);
-      if (!binaryPath) {
-        if (attempt === 1) {
-          console.error(
-            `[prepare-nuwaxcode] ${key}: 解压后未找到可执行文件（候选: ${binaryCandidates.join(', ')}）`,
-          );
-          return false;
-        }
-        continue;
-      }
-
-      // 复制前先清理目标目录，避免旧版本 assets 文件被“增量复制”保留下来。
-      resetDestBinDir(destDir);
-
-      const extractedBinDir = path.dirname(binaryPath);
-      const extractedBaseName = path.basename(binaryPath);
-
-      // 复制策略：
-      // A. 命中标准名（nuwaxcode）时，复制整个 bin 目录，尽量保留同目录 assets
-      // B. 命中别名（opencode）时，按目标标准名落盘，保证后续路径稳定
-      if (extractedBaseName === binary) {
-        fs.cpSync(extractedBinDir, destDir, { recursive: true });
-      } else {
-        fs.copyFileSync(binaryPath, destPath);
-        // 复制同目录 assets（如 models.json）
-        const assetsDir = path.join(extractedBinDir, 'assets');
-        if (fs.existsSync(assetsDir)) {
-          const destAssetsDir = path.join(destDir, 'assets');
-          fs.mkdirSync(destAssetsDir, { recursive: true });
-          fs.cpSync(assetsDir, destAssetsDir, { recursive: true });
-        }
-      }
-      ensureModelJson(destDir, NUWAXCODE_VERSION);
-      fs.chmodSync(destPath, 0o755);
-
-      const sizeMB = (fs.statSync(destPath).size / 1024 / 1024).toFixed(1);
-      console.log(`[prepare-nuwaxcode] ${key} ✓ 从 GitHub Release 下载 (${sizeMB} MB)`);
-
-      // macOS ad-hoc 签名
-      codesign(destPath, key);
-
-      // 计算 SHA256（签名后），用于打印 + 保存
-      const hash = sha256File(destPath);
-
-      // 验证二进制内部版本号 + 打印 SHA256
-      const innerVersion = verifyBinaryVersion(destPath, NUWAXCODE_VERSION, key, hash);
-      if (innerVersion && innerVersion !== NUWAXCODE_VERSION) {
-        // 常见于：本地缓存的 tar.gz 仍是旧内容（例如同名资产被替换、或缓存命中导致一直用旧包）
-        // 第一次发现不一致时，删除缓存并强制重新下载再试一次。
-        if (attempt === 0) {
+  let lastErr = null;
+  for (const assetName of assetCandidates) {
+    const downloadUrl = `https://github.com/${NUWAXCODE_REPO}/releases/download/v${NUWAXCODE_VERSION}/${assetName}`;
+    console.log(`[prepare-nuwaxcode] ${key}: 尝试下载 ${assetName} ...`);
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const force = attempt > 0;
+        if (force) {
           console.warn(
-            `[prepare-nuwaxcode] ${key}: 检测到二进制版本不一致，将删除缓存并强制重新下载 ${assetName} 再验证一次`,
+            `[prepare-nuwaxcode] ${key}: 归档解压失败（常见于缓存被截断），将删除缓存并重新下载 ${assetName}`,
           );
+        }
+
+        const archivePath = await download(downloadUrl, assetName, { force });
+
+        // 解压到临时目录
+        const extractDir = path.join(cacheDir, `extract-${key}`);
+        if (fs.existsSync(extractDir)) {
+          try { fs.rmSync(extractDir, { recursive: true }); } catch (_) {}
+        }
+        fs.mkdirSync(extractDir, { recursive: true });
+
+        const tarArchivePath = toTarPath(archivePath);
+        const tarExtractDir = toTarPath(extractDir);
+
+        // 使用参数数组调用 tar，避免在 Windows/MSYS 下对 C:\ 路径的错误解析。
+        // --force-local 仅在 win32 且 tar 支持时使用（macOS BSD tar 不支持该选项）。
+        const tarArgs = ['-xzf', tarArchivePath, '-C', tarExtractDir];
+        if (process.platform === 'win32') {
+          try {
+            const tarHelp = execFileSync('tar', ['--help'], { encoding: 'utf-8', stdio: 'pipe' });
+            if (typeof tarHelp === 'string' && tarHelp.includes('--force-local')) {
+              tarArgs.unshift('--force-local');
+            }
+          } catch (_) {}
+        }
+
+        try {
+          execFileSync('tar', tarArgs, { stdio: 'pipe' });
+        } catch (tarErr) {
+          if (attempt === 1) throw tarErr;
           continue;
         }
+
+        // 查找二进制文件：优先新名称 nuwaxcode，其次兼容旧名称 opencode。
+        // 背景：部分历史 release 资产仍产出 opencode 可执行文件。
+        const binaryCandidates = getBinaryCandidates(key);
+        const binaryPath = findBinary(extractDir, binaryCandidates);
+        if (!binaryPath) {
+          if (attempt === 1) {
+            throw new Error(`解压后未找到可执行文件（候选: ${binaryCandidates.join(', ')}）`);
+          }
+          continue;
+        }
+
+        // 复制前先清理目标目录，避免旧版本 assets 文件被“增量复制”保留下来。
+        resetDestBinDir(destDir);
+
+        const extractedBinDir = path.dirname(binaryPath);
+        const extractedBaseName = path.basename(binaryPath);
+
+        // 复制策略：
+        // A. 命中标准名（nuwaxcode）时，复制整个 bin 目录，尽量保留同目录 assets
+        // B. 命中别名（opencode）时，按目标标准名落盘，保证后续路径稳定
+        if (extractedBaseName === binary) {
+          fs.cpSync(extractedBinDir, destDir, { recursive: true });
+        } else {
+          fs.copyFileSync(binaryPath, destPath);
+          // 复制同目录 assets（如 models.json）
+          const assetsDir = path.join(extractedBinDir, 'assets');
+          if (fs.existsSync(assetsDir)) {
+            const destAssetsDir = path.join(destDir, 'assets');
+            fs.mkdirSync(destAssetsDir, { recursive: true });
+            fs.cpSync(assetsDir, destAssetsDir, { recursive: true });
+          }
+        }
+        ensureModelJson(destDir, NUWAXCODE_VERSION);
+        fs.chmodSync(destPath, 0o755);
+
+        const sizeMB = (fs.statSync(destPath).size / 1024 / 1024).toFixed(1);
+        console.log(`[prepare-nuwaxcode] ${key} ✓ 从 GitHub Release 下载 (${sizeMB} MB)`);
+
+        // macOS ad-hoc 签名
+        codesign(destPath, key);
+
+        // 计算 SHA256（签名后），用于打印 + 保存
+        const hash = sha256File(destPath);
+
+        // 验证二进制内部版本号 + 打印 SHA256
+        const innerVersion = verifyBinaryVersion(destPath, NUWAXCODE_VERSION, key, hash);
+        if (innerVersion && innerVersion !== NUWAXCODE_VERSION) {
+          // 常见于：本地缓存的 tar.gz 仍是旧内容（例如同名资产被替换、或缓存命中导致一直用旧包）
+          // 第一次发现不一致时，删除缓存并强制重新下载再试一次。
+          if (attempt === 0) {
+            console.warn(
+              `[prepare-nuwaxcode] ${key}: 检测到二进制版本不一致，将删除缓存并强制重新下载 ${assetName} 再验证一次`,
+            );
+            continue;
+          }
+        }
+
+        // 保存 SHA256 记录，下次可精确跳过
+        fs.writeFileSync(path.join(resDir, `.sha256-${resourceKey}`), hash, 'utf-8');
+
+        return true;
       }
-
-      // 保存 SHA256 记录，下次可精确跳过
-      fs.writeFileSync(path.join(resDir, `.sha256-${resourceKey}`), hash, 'utf-8');
-
-      return true;
+    } catch (err) {
+      lastErr = err;
+      // 如果新命名不存在（404），自动回退旧命名继续尝试；其他错误也继续尝试下一候选。
+      console.warn(`[prepare-nuwaxcode] ${key}: 资产 ${assetName} 失败 (${err.message})，尝试下一个命名...`);
     }
-  } catch (err) {
-    console.error(`[prepare-nuwaxcode] ${key}: 下载失败: ${err.message}`);
-    console.error(`[prepare-nuwaxcode] 请确认 GitHub Release 存在: https://github.com/${NUWAXCODE_REPO}/releases/tag/v${NUWAXCODE_VERSION}`);
-    return false;
   }
+
+  console.error(`[prepare-nuwaxcode] ${key}: 下载失败: ${lastErr ? lastErr.message : 'unknown error'}`);
+  console.error(`[prepare-nuwaxcode] 请确认 GitHub Release 存在: https://github.com/${NUWAXCODE_REPO}/releases/tag/v${NUWAXCODE_VERSION}`);
+  return false;
 }
 
 /**
