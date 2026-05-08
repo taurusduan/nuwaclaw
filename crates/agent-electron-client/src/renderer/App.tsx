@@ -40,7 +40,11 @@ import {
   normalizeServerHost,
   loginAndRegister,
 } from "./services/core/auth";
-import { APP_DISPLAY_NAME, AUTH_KEYS } from "@shared/constants";
+import {
+  APP_DISPLAY_NAME,
+  AUTH_KEYS,
+  normalizeAgentEngine,
+} from "@shared/constants";
 import type { QuickInitConfig } from "@shared/types/quickInit";
 import type { UpdateState } from "@shared/types/updateTypes";
 import { t, getCurrentLang } from "./services/core/i18n";
@@ -636,7 +640,7 @@ function App() {
               "step1_config",
             )) as { workspaceDir?: string } | null;
             result = await window.electronAPI?.agent.init({
-              engine: agentConfig?.type || "claude-code",
+              engine: normalizeAgentEngine(agentConfig?.type),
               apiKey: agentConfig?.apiKey,
               baseUrl: agentConfig?.apiBaseUrl,
               model: agentConfig?.model,
